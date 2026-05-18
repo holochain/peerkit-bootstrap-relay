@@ -1,0 +1,45 @@
+name: Deploy
+
+# STUB deploy workflow. Implements GitHub issue holochain/peerkit#5
+# requirement 4: manual deployment when a new app version releases.
+# Wire up real DigitalOcean provisioning in scripts/deploy.sh.
+
+on:
+  workflow_dispatch:
+    inputs:
+      app_version:
+        description: "peerkit app version to deploy the relay for"
+        required: true
+        type: string
+
+concurrency:
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: "ubuntu-latest"
+    environment: production
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6
+        with:
+          node-version: "22"
+          cache: "npm"
+      - run: npm ci
+      - run: npm run build
+      - name: Deploy relay to DigitalOcean
+        # ZIZMOR-TEMPLATE-INJECTION: inputs/secrets passed via env, not inlined.
+        env:
+          APP_VERSION: ${{ inputs.app_version }}
+          DIGITALOCEAN_ACCESS_TOKEN: ${{ secrets.DIGITALOCEAN_ACCESS_TOKEN }}
+          DROPLET_NAME: ${{ secrets.DROPLET_NAME }}
+          PEERKIT_NETWORK_SECRET: ${{ secrets.PEERKIT_NETWORK_SECRET }}
+        run: |
+          echo "Deploying relay for app version: $APP_VERSION"
+          ./scripts/deploy.sh
