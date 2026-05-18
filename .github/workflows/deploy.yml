@@ -1,29 +1,45 @@
-name: Deploy relay
+name: Deploy
+
+# STUB deploy workflow. Implements GitHub issue holochain/peerkit#5
+# requirement 4: manual deployment when a new app version releases.
+# Wire up real DigitalOcean provisioning in scripts/deploy.sh.
 
 on:
   workflow_dispatch:
     inputs:
-      repo_ref:
-        description: Git branch or tag to build the relay from
+      app_version:
+        description: "peerkit app version to deploy the relay for"
         required: true
-        default: feat/2-finish-and-deploy-relay
-      region:
-        description: DO region slug
-        required: true
-        default: lon1
-      size:
-        description: DO droplet size slug
-        required: true
-        default: s-1vcpu-2gb
+        type: string
+
+concurrency:
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: false
 
 permissions:
   contents: read
 
 jobs:
-  placeholder:
-    runs-on: ubuntu-latest
+  deploy:
+    runs-on: "ubuntu-latest"
+    environment: production
     steps:
-      - name: Explain how to deploy
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6
+        with:
+          node-version: "22"
+          cache: "npm"
+      - run: npm ci
+      - run: npm run build
+      - name: Deploy relay to DigitalOcean
+        # ZIZMOR-TEMPLATE-INJECTION: inputs/secrets passed via env, not inlined.
+        env:
+          APP_VERSION: ${{ inputs.app_version }}
+          DIGITALOCEAN_ACCESS_TOKEN: ${{ secrets.DIGITALOCEAN_ACCESS_TOKEN }}
+          DROPLET_NAME: ${{ secrets.DROPLET_NAME }}
+          PEERKIT_NETWORK_SECRET: ${{ secrets.PEERKIT_NETWORK_SECRET }}
         run: |
-          echo "This placeholder exists only so GitHub exposes the Deploy relay workflow on the default branch."
-          echo "Use the workflow branch selector to run Deploy relay from feat/2-finish-and-deploy-relay."
+          echo "Deploying relay for app version: $APP_VERSION"
+          ./scripts/deploy.sh

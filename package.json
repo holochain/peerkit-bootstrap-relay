@@ -1,0 +1,62 @@
+{
+  "name": "peerkit-bootstrap-relay",
+  "version": "0.1.0",
+  "description": "Bootstrap/relay node for peerkit networks (showcase app and Wind Tunnel testing)",
+  "keywords": [
+    "p2p",
+    "peer-to-peer",
+    "peerkit",
+    "relay",
+    "bootstrap",
+    "libp2p"
+  ],
+  "author": "dev-team@holochain.org",
+  "license": "CAL-1.0",
+  "private": true,
+  "bugs": {
+    "url": "https://github.com/holochain/peerkit/issues"
+  },
+  "homepage": "https://github.com/holochain/peerkit-bootstrap-relay#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/holochain/peerkit-bootstrap-relay.git"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "type": "module",
+  "main": "dist/index.js",
+  "bin": {
+    "peerkit-relay": "dist/index.js"
+  },
+  "scripts": {
+    "start": "node dist/index.js",
+    "compute-network-access": "node scripts/compute-network-access.mjs",
+    "lint": "eslint",
+    "fmt": "prettier . --write",
+    "fmt:check": "prettier . --check",
+    "build": "tsc --build",
+    "test": "vitest --run --passWithNoTests",
+    "prepare": "husky"
+  },
+  "lint-staged": {
+    "*.{ts,tsx,js,mjs,cjs,json,md,yml,yaml}": "prettier --write",
+    "*.{ts,tsx,js,mjs,cjs}": "eslint --fix"
+  },
+  "dependencies": {
+    "@peerkit/api": "git+https://github.com/holochain/peerkit.git#main",
+    "@peerkit/transport-libp2p-nodejs": "git+https://github.com/holochain/peerkit.git#main"
+  },
+  "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "@types/node": "^24.6.0",
+    "eslint": "^10.2.0",
+    "globals": "^17.5.0",
+    "husky": "^9.1.7",
+    "lint-staged": "^16.4.0",
+    "prettier": "3.8.2",
+    "typescript": "^6.0.2",
+    "typescript-eslint": "^8.58.2",
+    "vitest": "^4.1.5"
+  }
+}
