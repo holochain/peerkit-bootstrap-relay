@@ -1,20 +1,19 @@
 name: Deploy
 
-# STUB deploy workflow. Implements GitHub issue holochain/peerkit#5
-# requirement 4: manual deployment when a new app version releases.
-# Wire up real DigitalOcean provisioning in scripts/deploy.sh.
+# Manual deploy of the peerkit bootstrap/relay to its DigitalOcean droplet.
 
 on:
   workflow_dispatch:
     inputs:
-      app_version:
-        description: "peerkit app version to deploy the relay for"
+      ref:
+        description: "Git ref (tag or branch) to deploy"
         required: true
         type: string
+        default: "main"
 
 concurrency:
-  group: deploy-${{ github.ref }}
-  cancel-in-progress: false
+  group: deploy-relay
+  cancel-in-progress: true
 
 permissions:
   contents: read
@@ -24,22 +23,51 @@ jobs:
     runs-on: "ubuntu-latest"
     environment: production
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions/checkout@v6
         with:
+          ref: ${{ inputs.ref }}
           persist-credentials: false
-      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6
+
+      - uses: actions/setup-node@v6
         with:
           node-version: "22"
           cache: "npm"
+
       - run: npm ci
+
       - run: npm run build
-      - name: Deploy relay to DigitalOcean
+
+      - name: Configure SSH credentials
+        # ZIZMOR-TEMPLATE-INJECTION: secrets piped via env to a fixed script.
+        env:
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          DEPLOY_KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
+        run: |
+          install -d -m 700 "$RUNNER_TEMP/ssh"
+          umask 077
+          printf '%s\n' "$DEPLOY_SSH_KEY" > "$RUNNER_TEMP/ssh/id"
+          printf '%s\n' "$DEPLOY_KNOWN_HOSTS" > "$RUNNER_TEMP/ssh/known_hosts"
+          chmod 600 "$RUNNER_TEMP/ssh/id" "$RUNNER_TEMP/ssh/known_hosts"
+
+      - name: Deploy
         # ZIZMOR-TEMPLATE-INJECTION: inputs/secrets passed via env, not inlined.
         env:
-          APP_VERSION: ${{ inputs.app_version }}
-          DIGITALOCEAN_ACCESS_TOKEN: ${{ secrets.DIGITALOCEAN_ACCESS_TOKEN }}
-          DROPLET_NAME: ${{ secrets.DROPLET_NAME }}
+          RELEASE_REF: ${{ inputs.ref }}
+          DEPLOY_SSH_HOST: ${{ secrets.DEPLOY_SSH_HOST }}
+          DEPLOY_SSH_USER: ${{ secrets.DEPLOY_SSH_USER }}
+          DEPLOY_SSH_KEY_PATH: ${{ runner.temp }}/ssh/id
+          DEPLOY_KNOWN_HOSTS_PATH: ${{ runner.temp }}/ssh/known_hosts
           PEERKIT_NETWORK_SECRET: ${{ secrets.PEERKIT_NETWORK_SECRET }}
-        run: |
-          echo "Deploying relay for app version: $APP_VERSION"
-          ./scripts/deploy.sh
+          PEERKIT_OTEL_OTLP_ENDPOINT: ${{ secrets.PEERKIT_OTEL_OTLP_ENDPOINT }}
+          PEERKIT_OTEL_HEADERS: ${{ secrets.PEERKIT_OTEL_HEADERS }}
+          PEERKIT_PUBLIC_HOST: ${{ secrets.PEERKIT_PUBLIC_HOST }}
+          PEERKIT_RELAY_LISTEN_ADDRS: ${{ secrets.PEERKIT_RELAY_LISTEN_ADDRS }}
+        run: bash scripts/deploy.sh
+
+      - name: Upload multiaddr artifact
+        if: always()
+        uses: actions/upload-artifact@v5
+        with:
+          name: relay-multiaddr
+          path: relay-multiaddr.txt
+          if-no-files-found: ignore
