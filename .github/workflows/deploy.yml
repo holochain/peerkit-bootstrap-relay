@@ -1,73 +1,225 @@
-name: Deploy
+name: Deploy relay
 
-# Manual deploy of the peerkit bootstrap/relay to its DigitalOcean droplet.
-
+# Manually triggered. Provisions a fresh DigitalOcean droplet from
+# infra/cloud-init.yaml (relay only), waits for cloud-init, delivers the
+# network secret and the persisted relay certificate over SSH, then reassigns
+# the Reserved IP to the new droplet so the announced multiaddr stays stable.
+# The certhash is printed in the run summary - bake it into client dial
+# multiaddrs.
+#
+# The relay cert is generated once, locally, with scripts/gen-cert.mjs
+# (npm run gen-cert) and stored verbatim as the RELAY_CERT_JSON secret. It is
+# NOT regenerated per deploy, so the certhash never changes. The cert is valid
+# for 5 years - re-mint it and update the secret before it expires.
+#
+# Immutable model: each run creates a NEW droplet. The network secret and the
+# relay cert private key never touch cloud-init user-data (delivered over SSH).
+# The old droplet is left running so a bad deploy can be rolled back by
+# reassigning the Reserved IP back; delete it manually after verifying.
 on:
   workflow_dispatch:
     inputs:
-      ref:
-        description: "Git ref (tag or branch) to deploy"
+      repo_ref:
+        description: Git branch or tag to build the relay from
         required: true
-        type: string
-        default: "main"
-
-concurrency:
-  group: deploy-relay
-  cancel-in-progress: true
+        default: main
+      region:
+        description: DO region slug
+        required: true
+        default: lon1
+      size:
+        description: DO droplet size slug
+        required: true
+        default: s-1vcpu-2gb
 
 permissions:
   contents: read
 
+concurrency:
+  group: deploy-relay
+  cancel-in-progress: false
+
+env:
+  # Single droplet per repo - name is fixed, not an input.
+  DROPLET_NAME: peerkit-bootstrap-relay
+
 jobs:
   deploy:
-    runs-on: "ubuntu-latest"
+    runs-on: ubuntu-latest
+    # Secrets and the RESERVED_IP variable live in this Actions environment.
     environment: production
     steps:
-      - uses: actions/checkout@v6
+      - name: Check out
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
-          ref: ${{ inputs.ref }}
           persist-credentials: false
 
-      - uses: actions/setup-node@v6
+      - name: Install doctl
+        uses: digitalocean/action-doctl@3cb3953159719656269e044e0e24ca16dd2a690f # v2.5.2
         with:
-          node-version: "22"
-          cache: "npm"
+          token: ${{ secrets.DIGITALOCEAN_ACCESS_TOKEN }}
 
-      - run: npm ci
-
-      - run: npm run build
-
-      - name: Configure SSH credentials
-        # ZIZMOR-TEMPLATE-INJECTION: secrets piped via env to a fixed script.
+      # Substitute placeholders in cloud-init. Untrusted values reach the script
+      # only through env vars and are applied with bash parameter expansion
+      # (`${s//pat/rep}`), which substitutes literally.
+      #
+      # The ref is resolved to a full commit SHA *here*, before rendering, and
+      # the droplet clones that exact SHA. Rendering the mutable ref and
+      # resolving the SHA separately would let a branch/tag move between the two
+      # and deploy a different commit than the summary records.
+      - name: Render cloud-init
+        id: render
         env:
-          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
-          DEPLOY_KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
+          REPO_REF: ${{ inputs.repo_ref }}
+          RESERVED_IP: ${{ vars.RESERVED_IP }}
+          GH_TOKEN: ${{ github.token }}
         run: |
-          install -d -m 700 "$RUNNER_TEMP/ssh"
-          umask 077
-          printf '%s\n' "$DEPLOY_SSH_KEY" > "$RUNNER_TEMP/ssh/id"
-          printf '%s\n' "$DEPLOY_KNOWN_HOSTS" > "$RUNNER_TEMP/ssh/known_hosts"
-          chmod 600 "$RUNNER_TEMP/ssh/id" "$RUNNER_TEMP/ssh/known_hosts"
+          if [ -z "$RESERVED_IP" ]; then
+            echo "::error::RESERVED_IP variable is not set"; exit 1
+          fi
+          sha=$(gh api "repos/${GITHUB_REPOSITORY}/commits/${REPO_REF}" --jq '.sha')
+          echo "resolved ${REPO_REF} -> ${sha}"
+          echo "commit_sha=$sha" >> "$GITHUB_OUTPUT"
+          s=$(cat infra/cloud-init.yaml)
+          s=${s//__COMMIT_SHA__/$sha}
+          s=${s//__RESERVED_IP__/$RESERVED_IP}
+          printf '%s\n' "$s" > user-data.yaml
+          # cloud-init's YAML loader rejects non-ASCII bytes and silently drops
+          # the whole config. Fail here instead, pointing at the offending byte.
+          if LC_ALL=C grep -nP '[^\x00-\x7F]' user-data.yaml; then
+            echo "::error::rendered user-data contains non-ASCII bytes; cloud-init would reject it"
+            exit 1
+          fi
 
-      - name: Deploy
-        # ZIZMOR-TEMPLATE-INJECTION: inputs/secrets passed via env, not inlined.
+      - name: Create droplet
+        id: create
         env:
-          RELEASE_REF: ${{ inputs.ref }}
-          DEPLOY_SSH_HOST: ${{ secrets.DEPLOY_SSH_HOST }}
-          DEPLOY_SSH_USER: ${{ secrets.DEPLOY_SSH_USER }}
-          DEPLOY_SSH_KEY_PATH: ${{ runner.temp }}/ssh/id
-          DEPLOY_KNOWN_HOSTS_PATH: ${{ runner.temp }}/ssh/known_hosts
-          PEERKIT_NETWORK_SECRET: ${{ secrets.PEERKIT_NETWORK_SECRET }}
-          PEERKIT_OTEL_OTLP_ENDPOINT: ${{ secrets.PEERKIT_OTEL_OTLP_ENDPOINT }}
-          PEERKIT_OTEL_HEADERS: ${{ secrets.PEERKIT_OTEL_HEADERS }}
-          PEERKIT_PUBLIC_HOST: ${{ secrets.PEERKIT_PUBLIC_HOST }}
-          PEERKIT_RELAY_LISTEN_ADDRS: ${{ secrets.PEERKIT_RELAY_LISTEN_ADDRS }}
-        run: bash scripts/deploy.sh
+          NAME: ${{ env.DROPLET_NAME }}
+          REGION: ${{ inputs.region }}
+          SIZE: ${{ inputs.size }}
+          # Comma-separated SSH key fingerprints, one per authorized operator.
+          SSH_KEYS: ${{ secrets.DO_SSH_KEY_FINGERPRINTS }}
+          SHA: ${{ steps.render.outputs.commit_sha }}
+        run: |
+          echo "deploying commit ${SHA}"
+          id=$(doctl compute droplet create "$NAME" \
+            --image ubuntu-24-04-x64 \
+            --region "$REGION" --size "$SIZE" \
+            --ssh-keys "$SSH_KEYS" \
+            --tag-names "peerkit,commit:${SHA}" \
+            --enable-monitoring \
+            --user-data-file user-data.yaml \
+            --wait --no-header --format ID)
+          echo "droplet_id=$id" >> "$GITHUB_OUTPUT"
+          echo "commit_sha=$SHA" >> "$GITHUB_OUTPUT"
+          ip=$(doctl compute droplet get "$id" --no-header --format PublicIPv4)
+          echo "droplet_ip=$ip" >> "$GITHUB_OUTPUT"
 
-      - name: Upload multiaddr artifact
-        if: always()
-        uses: actions/upload-artifact@v5
-        with:
-          name: relay-multiaddr
-          path: relay-multiaddr.txt
-          if-no-files-found: ignore
+      # Wait for cloud-init to finish, then deliver the network secret and the
+      # persisted relay cert over SSH and restart the relay to adopt them.
+      - name: Deliver secrets over SSH
+        env:
+          SSH_KEY: ${{ secrets.DO_SSH_PRIVATE_KEY }}
+          IP: ${{ steps.create.outputs.droplet_ip }}
+          NETWORK_SECRET: ${{ secrets.PEERKIT_NETWORK_SECRET }}
+          RELAY_CERT_JSON: ${{ secrets.RELAY_CERT_JSON }}
+        run: |
+          # Remove every secret file on ANY exit, not just the success path, so
+          # a failed validation/SSH/SCP/restart never leaves them in the
+          # workspace for later steps.
+          trap 'rm -f key relay-cert.json network-secret.env' EXIT
+          # Trailing newline required - OpenSSH rejects a key file without one.
+          printf '%s\n' "$SSH_KEY" > key && chmod 600 key
+          if ! ssh-keygen -y -f key >/dev/null 2>&1; then
+            echo "::error::DO_SSH_PRIVATE_KEY is not a valid OpenSSH private key"
+            exit 1
+          fi
+          ssh_opts=(-i key -o StrictHostKeyChecking=accept-new -o ConnectTimeout=15 -o BatchMode=yes)
+          # shellcheck disable=SC2029  # remote commands are single-quoted literals meant to run on the droplet
+          remote() { ssh "${ssh_opts[@]}" "root@${IP}" "$@"; }
+          # `doctl --wait` returns at "active", before sshd accepts connections,
+          # so early attempts can be reset. Retry until the box answers, then
+          # block on cloud-init. Transport failure is exit 255 (retry); any
+          # other non-zero is a real cloud-init error (hard-fail).
+          deadline=$((SECONDS + 900))
+          while :; do
+            remote 'cloud-init status --wait' && break
+            rc=$?
+            if [ "$rc" = 255 ]; then
+              if [ "$SECONDS" -ge "$deadline" ]; then
+                echo "::error::droplet SSH never became reachable"; exit 1
+              fi
+              echo "sshd not ready yet, retrying in 10s..."; sleep 10; continue
+            fi
+            remote 'cloud-init status --long; tail -n 100 /var/log/cloud-init-output.log' || true
+            echo "::error::cloud-init did not finish cleanly on the droplet"
+            exit 1
+          done
+          # Validate inputs before mutating the box.
+          if [ -z "$NETWORK_SECRET" ]; then
+            echo "::error::PEERKIT_NETWORK_SECRET is empty"; exit 1
+          fi
+          # The secret is written verbatim into a systemd EnvironmentFile
+          # (KEY=value, one line). A newline or other control byte would
+          # truncate the value or inject extra assignments, so require a single
+          # line of printable ASCII.
+          if printf '%s' "$NETWORK_SECRET" | LC_ALL=C grep -qP '[^\x20-\x7e]'; then
+            echo "::error::PEERKIT_NETWORK_SECRET must be a single line of printable ASCII"; exit 1
+          fi
+          umask 077
+          printf '%s' "$RELAY_CERT_JSON" > relay-cert.json
+          # Require the three non-empty string fields the relay reads; jq -e .
+          # alone would accept {}, [], or null.
+          if ! jq -e '
+              type == "object"
+              and (.privateKeyPem | type == "string" and length > 0)
+              and (.certificatePem | type == "string" and length > 0)
+              and (.certhash | type == "string" and length > 0)
+            ' relay-cert.json >/dev/null 2>&1; then
+            echo "::error::RELAY_CERT_JSON is not a valid RelayCertificate (need non-empty string privateKeyPem, certificatePem, certhash)"; exit 1
+          fi
+          # Pass the network secret via a file (never on argv). Deliver both
+          # files, then append env lines on-box.
+          printf 'PEERKIT_NETWORK_SECRET=%s\n' "$NETWORK_SECRET" > network-secret.env
+          scp "${ssh_opts[@]}" relay-cert.json "root@${IP}:/tmp/relay-cert.json"
+          scp "${ssh_opts[@]}" network-secret.env "root@${IP}:/tmp/network-secret.env"
+          remote 'install -d -o peerkit -g peerkit -m 0750 /opt/peerkit-bootstrap-relay/certs
+                  install -o peerkit -g peerkit -m 0640 /tmp/relay-cert.json /opt/peerkit-bootstrap-relay/certs/relay-cert.json
+                  rm -f /tmp/relay-cert.json
+                  grep -q "^PEERKIT_RELAY_CERTIFICATE_FILE=" /etc/peerkit-relay.env || echo "PEERKIT_RELAY_CERTIFICATE_FILE=certs/relay-cert.json" >> /etc/peerkit-relay.env
+                  grep -q "^PEERKIT_NETWORK_SECRET=" /etc/peerkit-relay.env || cat /tmp/network-secret.env >> /etc/peerkit-relay.env
+                  rm -f /tmp/network-secret.env
+                  chown root:peerkit /etc/peerkit-relay.env
+                  chmod 0640 /etc/peerkit-relay.env
+                  systemctl restart peerkit-relay'
+
+      # Assign the Reserved IP only now that the new droplet is built and the
+      # relay has adopted its persisted cert.
+      - name: Assign Reserved IP
+        env:
+          RESERVED_IP: ${{ vars.RESERVED_IP }}
+          ID: ${{ steps.create.outputs.droplet_id }}
+        run: |
+          doctl compute reserved-ip-action assign "$RESERVED_IP" "$ID" --wait
+          echo "Reserved IP $RESERVED_IP -> droplet $ID"
+
+      - name: Summary
+        env:
+          IP: ${{ steps.create.outputs.droplet_ip }}
+          ID: ${{ steps.create.outputs.droplet_id }}
+          SHA: ${{ steps.create.outputs.commit_sha }}
+          RESERVED_IP: ${{ vars.RESERVED_IP }}
+          RELAY_CERT_JSON: ${{ secrets.RELAY_CERT_JSON }}
+        run: |
+          certhash=$(jq -r '.certhash' <<<"$RELAY_CERT_JSON")
+          {
+            echo "Deployed droplet **$ID** ($IP) from commit \`$SHA\`."
+            echo "Reserved IP \`$RESERVED_IP\` now points at this droplet. DO monitoring enabled."
+            echo ""
+            echo "Relay certhash: \`$certhash\` - bake into client dial multiaddrs."
+            echo "Announced multiaddr base: \`/ip4/$RESERVED_IP/tcp/4001\`; read the exact"
+            echo "\`relay ready\` line from \`journalctl -u peerkit-relay\` for the peer id."
+            echo ""
+            echo "Old droplet (if any) left running; reassign the Reserved IP back to roll"
+            echo "back, then delete it manually after verifying."
+          } >> "$GITHUB_STEP_SUMMARY"

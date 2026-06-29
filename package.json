@@ -32,10 +32,12 @@
   "scripts": {
     "start": "node dist/index.js",
     "lint": "eslint",
+    "lint:md": "markdownlint-cli2 \"**/*.md\" \"#node_modules\" \"#dist\"",
     "fmt": "prettier . --write",
     "fmt:check": "prettier . --check",
     "build": "tsc --build tsconfig.build.json",
-    "test": "vitest --run --passWithNoTests",
+    "gen-cert": "node scripts/gen-cert.mjs",
+    "test": "vitest --run",
     "prepare": "husky"
   },
   "lint-staged": {
@@ -49,13 +51,17 @@
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",
+    "@peculiar/x509": "^2.0.0",
     "@types/node": "^24.12.4",
     "eslint": "^10.5.0",
     "get-port": "^7.2.0",
     "globals": "^17.5.0",
     "husky": "^9.1.7",
     "lint-staged": "^17.0.7",
+    "markdownlint-cli2": "^0.22.1",
+    "multiformats": "^13.4.2",
     "prettier": "3.8.4",
+    "reflect-metadata": "^0.2.2",
     "typescript": "^6.0.2",
     "typescript-eslint": "^8.61.1",
     "vitest": "^4.1.9"

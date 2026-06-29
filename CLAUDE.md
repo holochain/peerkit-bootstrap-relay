@@ -23,35 +23,39 @@ entry point.
   `crypto.timingSafeEqual` to avoid timing leaks on the network secret.
 - `src/cli.ts` — `parseCli` function. Reads `--flag` and `PEERKIT_*` env vars;
   returns validated `CliArgs` (id, listenAddrs, networkSecret, publicHost,
-  logLevel, otel). Throws `CliError` on bad input; caller maps to exit code 2.
+  certificate, logLevel, otel). The optional `certificate` is read from a JSON
+  file (`--certificate-file` / `PEERKIT_RELAY_CERTIFICATE_FILE`) and validated
+  into a `RelayCertificate`. Throws `CliError` on bad input; caller maps to
+  exit code 2.
 - `src/network-access.ts` — STUB derivation of `NetworkAccessBytes` via
   sha256(secret). Replace with the real scheme from peerkit
   `SPECIFICATIONS.md` before production use.
-- `scripts/deploy.sh` — DigitalOcean droplet rollout.
+- `scripts/gen-cert.mjs` — prints a fresh `RelayCertificate` JSON
+  (`npm run gen-cert`) for use as the persisted relay certificate.
 
 ## Deployment
 
-`scripts/deploy.sh` performs a zero-downtime rollout to a DigitalOcean droplet
-over SSH. It is driven by the `Deploy` GitHub Actions workflow
-(`.github/workflows/deploy.yml`) but is runnable standalone.
+The relay is deployed as a DigitalOcean droplet provisioned once by
+`infra/cloud-init.yaml` and driven by the manual `Deploy relay` workflow
+(`.github/workflows/deploy.yml`). Each run builds the relay from a git ref on a
+fresh droplet running under a hardened `peerkit-relay` systemd unit, delivers
+`PEERKIT_NETWORK_SECRET` and the persisted relay certificate over SSH (so
+neither lands in DO user-data), then reassigns a DigitalOcean Reserved IP.
 
-Required env: `DEPLOY_SSH_HOST`, `DEPLOY_SSH_USER`, `DEPLOY_SSH_KEY_PATH`,
-`DEPLOY_KNOWN_HOSTS_PATH`, `RELEASE_REF`, `PEERKIT_NETWORK_SECRET`. Optional:
-`PEERKIT_OTEL_OTLP_ENDPOINT`, `PEERKIT_OTEL_HEADERS`, `PEERKIT_PUBLIC_HOST`,
-`PEERKIT_RELAY_LISTEN_ADDRS` (derived from `DEPLOY_SSH_HOST` if unset).
+Droplets are immutable: each deploy creates a new droplet and reassigns the
+Reserved IP; the old one is left running for rollback and deleted manually. The
+Reserved IP plus the persisted certificate certhash keep the announced
+multiaddr stable across replacements.
 
-`@peerkit/relay` does not expose an HTTP endpoint, so readiness and the
-relay-info payload are read from the systemd journal rather than HTTP.
+`@peerkit/relay` does not expose an HTTP endpoint, so readiness is read from
+the container logs (`journalctl -u peerkit-relay`) rather than HTTP.
 
-Flow: build (`npm ci && npm run build`); rsync `dist`, `node_modules`, and
-manifests into `/opt/peerkit-relay/releases/<short-sha>`; write
-`/etc/peerkit-relay/env` (`root:peerkit-relay`, `0640`); stop the service,
-swap the `current` symlink, start it; wait for active (30s), then poll
-`journalctl -u peerkit-relay` for the `relay ready` log line (5×, 2s) —
-rollback to the previous release on failure; extract the `relay ready` JSON
-into `relay-multiaddr.txt`; prune all but the last 3 releases. The droplet
-runs the relay under the `peerkit-relay` systemd unit and requires
-`sudo journalctl` in the deploy user's NOPASSWD allowlist.
+Operator steps: allocate the Reserved IP once and store it as the `RESERVED_IP`
+Actions variable; `npm run --silent gen-cert` and store the JSON as the
+`RELAY_CERT_JSON` secret; set `PEERKIT_NETWORK_SECRET`,
+`DIGITALOCEAN_ACCESS_TOKEN`, `DO_SSH_KEY_FINGERPRINTS`, and `DO_SSH_PRIVATE_KEY`
+secrets; run the `Deploy relay` workflow. See `infra/README.md` for the full
+runbook.
 
 ## peerkit dependency
 
@@ -89,6 +93,7 @@ Do not run CI checks unless explicitly asked. When asked, run what
 `.github/workflows/test.yml` runs:
 
 - `npm run lint`
+- `npm run lint:md`
 - `npm run fmt:check`
 - `npm run build`
 - `npm test`

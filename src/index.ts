@@ -31,11 +31,13 @@ async function main(): Promise<void> {
 
   // make relay config
   const config: RelayConfig = {
+    id: cliArgs.id,
     listenAddrs: cliArgs.listenAddrs,
     networkAccessBytes: cliArgs.networkSecret,
     networkAccessHandler: async (_nodeId, bytes) =>
       verifyNetworkAccessBytes(cliArgs.networkSecret, bytes),
     publicIp: cliArgs.publicHost,
+    certificate: cliArgs.certificate,
     otel: cliArgs.otel
       ? {
           otlpEndpoint: cliArgs.otel.otlpEndpoint,

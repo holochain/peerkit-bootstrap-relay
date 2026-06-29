@@ -5,7 +5,10 @@
  * Validation errors throw CliError; caller maps to exit code 2.
  */
 
+import { readFileSync } from "node:fs";
+
 import meow from "meow";
+import { type RelayCertificate } from "@peerkit/relay";
 import { computeNetworkAccessBytes } from "./network-access.js";
 
 /** Allowed log-level values. */
@@ -41,6 +44,9 @@ function parseHeaders(raw: string): Record<string, string> {
     }
     const key = trimmed.slice(0, eq).trim();
     const value = trimmed.slice(eq + 1).trim();
+    if (key.length === 0) {
+      throw new CliError(`--otel-headers entry "${trimmed}" must be k=v`);
+    }
     out[key] = value;
   }
   return out;
@@ -51,6 +57,59 @@ export class CliError extends Error {
     super(message);
     this.name = "CliError";
   }
+}
+
+/** Required string fields of a serialized {@link RelayCertificate}. */
+const CERTIFICATE_FIELDS = [
+  "privateKeyPem",
+  "certificatePem",
+  "certhash",
+] as const;
+
+/**
+ * Read and validate a JSON certificate file holding a {@link RelayCertificate}
+ * ({@code privateKeyPem}, {@code certificatePem}, {@code certhash}). Throws
+ * {@link CliError} when the file is unreadable, not valid JSON, or missing any
+ * non-empty string field.
+ */
+function parseCertificateFile(path: string): RelayCertificate {
+  let raw: string;
+  try {
+    raw = readFileSync(path, "utf8");
+  } catch (error: unknown) {
+    const reason = error instanceof Error ? error.message : String(error);
+    throw new CliError(`failed to read certificate file "${path}": ${reason}`);
+  }
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (error: unknown) {
+    const reason = error instanceof Error ? error.message : String(error);
+    throw new CliError(
+      `certificate file "${path}" is not valid JSON: ${reason}`,
+    );
+  }
+
+  if (typeof parsed !== "object" || parsed === null) {
+    throw new CliError(`certificate file "${path}" must contain a JSON object`);
+  }
+
+  const record = parsed as Record<string, unknown>;
+  for (const field of CERTIFICATE_FIELDS) {
+    const value = record[field];
+    if (typeof value !== "string" || value.length === 0) {
+      throw new CliError(
+        `certificate file "${path}" is missing a non-empty string "${field}"`,
+      );
+    }
+  }
+
+  return {
+    privateKeyPem: record.privateKeyPem as string,
+    certificatePem: record.certificatePem as string,
+    certhash: record.certhash as string,
+  };
 }
 
 const DEFAULT_LISTEN_ADDRS: readonly string[] = [
@@ -71,6 +130,7 @@ const HELP_TEXT = `
     --listen-addr <multiaddr>...      Listen address(es)          [env: PEERKIT_RELAY_LISTEN_ADDRS]
     --network-secret <string>         Network secret (required)   [env: PEERKIT_NETWORK_SECRET]
     --public-host <host>              Public hostname             [env: PEERKIT_PUBLIC_HOST]
+    --certificate-file <path>         Relay certificate JSON file [env: PEERKIT_RELAY_CERTIFICATE_FILE]
     --log-level <level>               Log level                   [env: PEERKIT_LOG_LEVEL]
     --otel-otlp-endpoint <url>        OTLP metrics endpoint       [env: PEERKIT_OTEL_OTLP_ENDPOINT]
     --otel-export-interval-ms <ms>    OTLP export interval in ms  [env: PEERKIT_OTEL_EXPORT_INTERVAL_MS]
@@ -90,6 +150,7 @@ export interface CliArgs {
   listenAddrs: string[];
   networkSecret: Uint8Array;
   publicHost?: string;
+  certificate?: RelayCertificate;
   logLevel: string;
   otel?: OtelConfig;
 }
@@ -107,6 +168,7 @@ export function parseCli(
       listenAddr: { type: "string", isMultiple: true },
       networkSecret: { type: "string" },
       publicHost: { type: "string" },
+      certificateFile: { type: "string" },
       logLevel: { type: "string" },
       otelOtlpEndpoint: { type: "string" },
       otelExportIntervalMs: { type: "string" },
@@ -161,6 +223,13 @@ export function parseCli(
   const otelEndpoint = flags.otelOtlpEndpoint ?? env.PEERKIT_OTEL_OTLP_ENDPOINT;
   let otel: OtelConfig | undefined;
   if (otelEndpoint) {
+    try {
+      new URL(otelEndpoint);
+    } catch {
+      throw new CliError(
+        `--otel-otlp-endpoint must be a valid URL, got ${otelEndpoint}`,
+      );
+    }
     const intervalRaw =
       flags.otelExportIntervalMs ??
       env.PEERKIT_OTEL_EXPORT_INTERVAL_MS ??
@@ -176,6 +245,12 @@ export function parseCli(
     };
   }
 
+  const certificateFile =
+    flags.certificateFile ?? env.PEERKIT_RELAY_CERTIFICATE_FILE;
+  const certificate = certificateFile
+    ? parseCertificateFile(certificateFile)
+    : undefined;
+
   const logLevelRaw =
     flags.logLevel ?? env.PEERKIT_LOG_LEVEL ?? DEFAULTS.logLevel;
   if (!(LOG_LEVELS as readonly string[]).includes(logLevelRaw)) {
@@ -190,6 +265,7 @@ export function parseCli(
     listenAddrs,
     networkSecret: computeNetworkAccessBytes(networkSecret),
     publicHost: flags.publicHost ?? env.PEERKIT_PUBLIC_HOST,
+    certificate,
     logLevel,
     otel,
   };
