@@ -1,0 +1,106 @@
+#cloud-config
+# One-shot provisioning for a DigitalOcean droplet running the PeerKit
+# bootstrap/relay (systemd unit: peerkit-relay).
+#
+# Sets machine state ONCE at first boot. No day-2 config management - to change
+# config, redeploy from an edited copy (the deploy workflow does the
+# substitution). See infra/README.md.
+#
+# Secrets are NOT handled here. The relay boots with an ephemeral certificate
+# and no network secret; the deploy workflow (.github/workflows/deploy.yml)
+# delivers PEERKIT_NETWORK_SECRET and the persisted relay certificate over SSH
+# after boot, so neither lands in DO user-data.
+#
+# The deploy workflow substitutes these placeholders (names written without the
+# surrounding underscores here so they aren't themselves replaced in this note):
+#   COMMIT_SHA   the resolved git commit the relay is built from
+#   RESERVED_IP  the DO Reserved IP announced as the relay's public host
+
+packages:
+  - git
+  - curl
+  - ca-certificates
+  - build-essential
+  - gnupg
+  - ufw
+
+write_files:
+  # ---- relay: systemd unit ----
+  - path: /etc/systemd/system/peerkit-relay.service
+    permissions: "0644"
+    content: |
+      [Unit]
+      Description=PeerKit bootstrap/relay (rendezvous for peer discovery)
+      After=network-online.target
+      Wants=network-online.target
+
+      [Service]
+      Type=simple
+      User=peerkit
+      Group=peerkit
+      WorkingDirectory=/opt/peerkit-bootstrap-relay
+      EnvironmentFile=/etc/peerkit-relay.env
+      ExecStart=/usr/bin/node dist/index.js
+      Restart=on-failure
+      RestartSec=5
+      # hardening
+      NoNewPrivileges=true
+      ProtectSystem=strict
+      ProtectHome=true
+      PrivateTmp=true
+      ProtectKernelTunables=true
+      ProtectControlGroups=true
+      RestrictSUIDSGID=true
+
+      [Install]
+      WantedBy=multi-user.target
+
+  # ---- relay: non-secret env. The deploy workflow appends
+  #      PEERKIT_NETWORK_SECRET and PEERKIT_RELAY_CERTIFICATE_FILE over SSH. ----
+  - path: /etc/peerkit-relay.env
+    permissions: "0640"
+    content: |
+      PEERKIT_RELAY_LISTEN_ADDRS=/ip4/0.0.0.0/tcp/4001,/ip6/::/tcp/4001
+      PEERKIT_PUBLIC_HOST=__RESERVED_IP__
+      PEERKIT_LOG_LEVEL=info
+
+runcmd:
+  # --- system user owning the relay checkout ---
+  - useradd --system --create-home --home-dir /var/lib/peerkit --shell /usr/sbin/nologin peerkit
+
+  # --- Node.js 22 (matches engines >=22) ---
+  # Add the NodeSource apt repo explicitly with a pinned signing key instead of
+  # piping a remote installer into root's shell; apt then verifies the package
+  # signature against that key.
+  - install -d -m 0755 /etc/apt/keyrings
+  - curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key | gpg --dearmor -o /etc/apt/keyrings/nodesource.gpg
+  - chmod 0644 /etc/apt/keyrings/nodesource.gpg
+  - echo "deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_22.x nodistro main" > /etc/apt/sources.list.d/nodesource.list
+  - apt-get update
+  - apt-get install -y nodejs
+
+  # --- build the relay from this repo ---
+  # `npm install`, not `npm ci`: npm 11 omits cross-platform optional binaries
+  # from the lock file, so `npm ci` refuses to proceed.
+  #
+  # Clone, then fetch and check out the exact commit the workflow resolved, so
+  # the build is pinned to that SHA even if the branch/tag moves after render.
+  - git clone --filter=blob:none --no-checkout https://github.com/holochain/peerkit-bootstrap-relay.git /opt/peerkit-bootstrap-relay
+  - git -C /opt/peerkit-bootstrap-relay fetch --depth 1 origin __COMMIT_SHA__
+  - git -C /opt/peerkit-bootstrap-relay checkout --detach __COMMIT_SHA__
+  - chown -R peerkit:peerkit /opt/peerkit-bootstrap-relay
+  - cd /opt/peerkit-bootstrap-relay && sudo -u peerkit HOME=/var/lib/peerkit npm install --no-audit --no-fund
+  - cd /opt/peerkit-bootstrap-relay && sudo -u peerkit HOME=/var/lib/peerkit npm run build
+
+  # --- env file readable by the peerkit user (root-owned, group peerkit) ---
+  - chown root:peerkit /etc/peerkit-relay.env
+  - chmod 0640 /etc/peerkit-relay.env
+
+  # --- firewall: SSH + relay TCP ---
+  - ufw allow OpenSSH
+  - ufw allow 4001/tcp
+  - ufw --force enable
+
+  # --- start the relay (ephemeral cert until the deploy delivers the real one) ---
+  - systemctl daemon-reload
+  - systemctl enable --now peerkit-relay

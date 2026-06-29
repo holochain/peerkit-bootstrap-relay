@@ -1,8 +1,26 @@
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
+import {
+  afterAll,
+  afterEach,
+  beforeAll,
+  describe,
+  expect,
+  it,
+  vi,
+} from "vitest";
 import { CliError, parseCli } from "../src/cli.js";
 import { computeNetworkAccessBytes } from "../src/network-access.js";
 
 const baseEnv = { PEERKIT_NETWORK_SECRET: "s" } as NodeJS.ProcessEnv;
+
+const VALID_CERTIFICATE = {
+  privateKeyPem: "-----BEGIN PRIVATE KEY-----\nMII\n-----END PRIVATE KEY-----",
+  certificatePem: "-----BEGIN CERTIFICATE-----\nMII\n-----END CERTIFICATE-----",
+  certhash: "uEiAexampleexampleexampleexampleexampleexampleexample",
+} as const;
 
 describe("parseCli", () => {
   it("loads defaults when only secret provided", () => {
@@ -126,6 +144,26 @@ describe("parseCli", () => {
     ).toThrowError(/otel-headers entry/);
   });
 
+  it("rejects --otel-headers entry with a blank key", () => {
+    expect(() =>
+      parseCli(
+        [
+          "--otel-otlp-endpoint",
+          "http://otel:4318/v1/metrics",
+          "--otel-headers",
+          " =value",
+        ],
+        baseEnv,
+      ),
+    ).toThrowError(/otel-headers entry/);
+  });
+
+  it("rejects an invalid --otel-otlp-endpoint URL", () => {
+    expect(() =>
+      parseCli(["--otel-otlp-endpoint", "not a url"], baseEnv),
+    ).toThrowError(/otel-otlp-endpoint must be a valid URL/);
+  });
+
   it("rejects non-integer --otel-export-interval-ms", () => {
     expect(() =>
       parseCli(
@@ -156,6 +194,90 @@ describe("parseCli", () => {
     expect(() =>
       parseCli(["--listen-addr", "/not/a/multiaddr"], baseEnv),
     ).toThrowError(/listen-addr\[0\]/);
+  });
+
+  describe("certificate file", () => {
+    let dir: string;
+
+    beforeAll(() => {
+      dir = mkdtempSync(join(tmpdir(), "peerkit-relay-cert-"));
+    });
+
+    afterAll(() => {
+      rmSync(dir, { recursive: true, force: true });
+    });
+
+    function writeCert(name: string, content: string): string {
+      const path = join(dir, name);
+      writeFileSync(path, content);
+      return path;
+    }
+
+    it("leaves certificate undefined when no file given", () => {
+      const cfg = parseCli([], baseEnv);
+      expect(cfg.certificate).toBeUndefined();
+    });
+
+    it("parses a valid certificate file from --certificate-file", () => {
+      const path = writeCert("valid.json", JSON.stringify(VALID_CERTIFICATE));
+      const cfg = parseCli(["--certificate-file", path], baseEnv);
+      expect(cfg.certificate).toEqual(VALID_CERTIFICATE);
+    });
+
+    it("parses a valid certificate file from PEERKIT_RELAY_CERTIFICATE_FILE", () => {
+      const path = writeCert(
+        "valid-env.json",
+        JSON.stringify(VALID_CERTIFICATE),
+      );
+      const cfg = parseCli([], {
+        ...baseEnv,
+        PEERKIT_RELAY_CERTIFICATE_FILE: path,
+      });
+      expect(cfg.certificate).toEqual(VALID_CERTIFICATE);
+    });
+
+    it("throws CliError when a required field is missing", () => {
+      const path = writeCert(
+        "missing-field.json",
+        JSON.stringify({
+          privateKeyPem: VALID_CERTIFICATE.privateKeyPem,
+          certificatePem: VALID_CERTIFICATE.certificatePem,
+        }),
+      );
+      expect(() =>
+        parseCli(["--certificate-file", path], baseEnv),
+      ).toThrowError(CliError);
+      expect(() =>
+        parseCli(["--certificate-file", path], baseEnv),
+      ).toThrowError(/certhash/);
+    });
+
+    it("throws CliError when a field is an empty string", () => {
+      const path = writeCert(
+        "empty-field.json",
+        JSON.stringify({ ...VALID_CERTIFICATE, certhash: "" }),
+      );
+      expect(() =>
+        parseCli(["--certificate-file", path], baseEnv),
+      ).toThrowError(/certhash/);
+    });
+
+    it("throws CliError on malformed JSON", () => {
+      const path = writeCert("malformed.json", "{ not valid json");
+      expect(() =>
+        parseCli(["--certificate-file", path], baseEnv),
+      ).toThrowError(CliError);
+      expect(() =>
+        parseCli(["--certificate-file", path], baseEnv),
+      ).toThrowError(/not valid JSON/);
+    });
+
+    it("throws CliError when the file does not exist", () => {
+      const path = join(dir, "does-not-exist.json");
+      expect(() =>
+        parseCli(["--certificate-file", path], baseEnv),
+      ).toThrowError(/failed to read certificate file/);
+    });
   });
 
   describe("--help", () => {
