@@ -1,0 +1,29 @@
+name: Deploy relay
+
+on:
+  workflow_dispatch:
+    inputs:
+      repo_ref:
+        description: Git branch or tag to build the relay from
+        required: true
+        default: feat/2-finish-and-deploy-relay
+      region:
+        description: DO region slug
+        required: true
+        default: lon1
+      size:
+        description: DO droplet size slug
+        required: true
+        default: s-1vcpu-2gb
+
+permissions:
+  contents: read
+
+jobs:
+  placeholder:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Explain how to deploy
+        run: |
+          echo "This placeholder exists only so GitHub exposes the Deploy relay workflow on the default branch."
+          echo "Use the workflow branch selector to run Deploy relay from feat/2-finish-and-deploy-relay."
