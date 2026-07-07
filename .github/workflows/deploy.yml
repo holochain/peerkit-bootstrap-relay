@@ -200,7 +200,8 @@ jobs:
           RESERVED_IP: ${{ vars.RESERVED_IP }}
           ID: ${{ steps.create.outputs.droplet_id }}
         run: |
-          doctl compute reserved-ip-action assign "$RESERVED_IP" "$ID" --wait
+          action_id=$(doctl compute reserved-ip-action assign "$RESERVED_IP" "$ID" --no-header --format ID)
+          doctl compute action wait "$action_id"
           echo "Reserved IP $RESERVED_IP -> droplet $ID"
 
       - name: Summary
