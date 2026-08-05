@@ -35,17 +35,32 @@ entry point.
 
 ## Deployment
 
-The relay is deployed as a DigitalOcean droplet provisioned once by
-`infra/cloud-init.yaml` and driven by the manual `Deploy relay` workflow
-(`.github/workflows/deploy.yml`). Each run builds the relay from a git ref on a
-fresh droplet running under a hardened `peerkit-relay` systemd unit, delivers
+The relay runs on ONE long-lived DigitalOcean droplet, named
+`peerkit-bootstrap-relay`, driven by the manual `Deploy relay` workflow
+(`.github/workflows/deploy.yml`). The droplet is **reused** on every deploy:
+the workflow looks it up by name, creates it only when missing, delivers
 `PEERKIT_NETWORK_SECRET` and the persisted relay certificate over SSH (so
-neither lands in DO user-data), then reassigns a DigitalOcean Reserved IP.
+neither lands in DO user-data), runs `infra/deploy.sh` on-box, and ensures the
+Reserved IP is assigned to it.
 
-Droplets are immutable: each deploy creates a new droplet and reassigns the
-Reserved IP; the old one is left running for rollback and deleted manually. The
-Reserved IP plus the persisted certificate certhash keep the announced
-multiaddr stable across replacements.
+The split matters:
+
+- `infra/cloud-init.yaml` — base machine only (packages, Node.js, `peerkit`
+  user, firewall). Runs once, at droplet creation, and has no placeholders.
+- `infra/deploy.sh` — everything commit-dependent: fetch/checkout the resolved
+  SHA, `npm install`, `npm run build`, install `infra/peerkit-relay.service`,
+  render `infra/relay.env.tmpl` to `/etc/peerkit-relay.env`, restart, verify
+  the unit is still active 15s later. Copied from the runner's checkout, not
+  run out of `/opt` (it rewrites that checkout).
+- Secrets live in a separate `EnvironmentFile`
+  (`/etc/peerkit-relay.secrets.env`) that `deploy.sh` never rewrites, so
+  re-rendering the non-secret env cannot drop them.
+
+Editing `cloud-init.yaml` does not reach a running droplet: deploy with
+`recreate: true`, which renames the old droplet to
+`peerkit-bootstrap-relay-old-<sha>`, builds a replacement, and moves the
+Reserved IP. The old droplet stays up for rollback and is deleted manually.
+Exactly one droplet may hold the base name; the deploy fails fast otherwise.
 
 `@peerkit/relay` does not expose an HTTP endpoint, so readiness is read from
 the container logs (`journalctl -u peerkit-relay`) rather than HTTP.

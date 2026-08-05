@@ -1,21 +1,25 @@
 name: Deploy relay
 
-# Manually triggered. Provisions a fresh DigitalOcean droplet from
-# infra/cloud-init.yaml (relay only), waits for cloud-init, delivers the
-# network secret and the persisted relay certificate over SSH, then reassigns
-# the Reserved IP to the new droplet so the announced multiaddr stays stable.
-# The certhash is printed in the run summary - bake it into client dial
-# multiaddrs.
+# Manually triggered. Deploys the relay onto the ONE long-lived DigitalOcean
+# droplet named by DROPLET_NAME, creating it from infra/cloud-init.yaml only if
+# it does not exist yet. A normal deploy reuses the droplet: it delivers the
+# network secret and the persisted relay certificate over SSH, then runs
+# infra/deploy.sh on-box to check out the resolved commit, rebuild, reinstall
+# the systemd unit and non-secret env, and restart the relay.
+#
+# The Reserved IP is what peers dial, so it is assigned to the droplet whenever
+# it is not already pointing there, and the run fails if it cannot be assigned.
 #
 # The relay cert is generated once, locally, with scripts/gen-cert.mjs
 # (npm run gen-cert) and stored verbatim as the RELAY_CERT_JSON secret. It is
 # NOT regenerated per deploy, so the certhash never changes. The cert is valid
 # for 5 years - re-mint it and update the secret before it expires.
 #
-# Immutable model: each run creates a NEW droplet. The network secret and the
-# relay cert private key never touch cloud-init user-data (delivered over SSH).
-# The old droplet is left running so a bad deploy can be rolled back by
-# reassigning the Reserved IP back; delete it manually after verifying.
+# `recreate: true` builds a replacement droplet instead of reusing the existing
+# one - needed when infra/cloud-init.yaml changes (Node major, packages,
+# firewall), since that file only runs at first boot. The old droplet is
+# renamed and left running so a bad deploy is rolled back by reassigning the
+# Reserved IP back to it; delete it manually after verifying.
 on:
   workflow_dispatch:
     inputs:
@@ -24,13 +28,18 @@ on:
         required: true
         default: main
       region:
-        description: DO region slug
+        description: DO region slug (only used when a droplet is created)
         required: true
         default: lon1
       size:
-        description: DO droplet size slug
+        description: DO droplet size slug (only used when a droplet is created)
         required: true
         default: s-1vcpu-2gb
+      recreate:
+        description: Build a replacement droplet instead of reusing the existing one
+        type: boolean
+        required: false
+        default: false
 
 permissions:
   contents: read
@@ -40,7 +49,8 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  # Single droplet per repo - name is fixed, not an input.
+  # Single droplet per repo - name is fixed, not an input. It is also the
+  # lookup key for reuse, so exactly one droplet may carry it.
   DROPLET_NAME: peerkit-bootstrap-relay
 
 jobs:
@@ -50,7 +60,7 @@ jobs:
     environment: production
     steps:
       - name: Check out
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
@@ -59,16 +69,11 @@ jobs:
         with:
           token: ${{ secrets.DIGITALOCEAN_ACCESS_TOKEN }}
 
-      # Substitute placeholders in cloud-init. Untrusted values reach the script
-      # only through env vars and are applied with bash parameter expansion
-      # (`${s//pat/rep}`), which substitutes literally.
-      #
-      # The ref is resolved to a full commit SHA *here*, before rendering, and
-      # the droplet clones that exact SHA. Rendering the mutable ref and
-      # resolving the SHA separately would let a branch/tag move between the two
-      # and deploy a different commit than the summary records.
-      - name: Render cloud-init
-        id: render
+      # The ref is resolved to a full commit SHA here, once, and the droplet
+      # checks out that exact SHA. Resolving it on-box instead would let a
+      # branch move between the summary and the build.
+      - name: Resolve commit
+        id: resolve
         env:
           REPO_REF: ${{ inputs.repo_ref }}
           RESERVED_IP: ${{ vars.RESERVED_IP }}
@@ -80,54 +85,76 @@ jobs:
           sha=$(gh api "repos/${GITHUB_REPOSITORY}/commits/${REPO_REF}" --jq '.sha')
           echo "resolved ${REPO_REF} -> ${sha}"
           echo "commit_sha=$sha" >> "$GITHUB_OUTPUT"
-          s=$(cat infra/cloud-init.yaml)
-          s=${s//__COMMIT_SHA__/$sha}
-          s=${s//__RESERVED_IP__/$RESERVED_IP}
-          printf '%s\n' "$s" > user-data.yaml
-          # cloud-init's YAML loader rejects non-ASCII bytes and silently drops
-          # the whole config. Fail here instead, pointing at the offending byte.
-          if LC_ALL=C grep -nP '[^\x00-\x7F]' user-data.yaml; then
-            echo "::error::rendered user-data contains non-ASCII bytes; cloud-init would reject it"
-            exit 1
-          fi
 
-      - name: Create droplet
-        id: create
+      # Reuse the existing droplet; create one only when none exists or the run
+      # explicitly asks for a replacement.
+      - name: Find or create droplet
+        id: droplet
         env:
           NAME: ${{ env.DROPLET_NAME }}
           REGION: ${{ inputs.region }}
           SIZE: ${{ inputs.size }}
+          RECREATE: ${{ inputs.recreate }}
           # Comma-separated SSH key fingerprints, one per authorized operator.
           SSH_KEYS: ${{ secrets.DO_SSH_KEY_FINGERPRINTS }}
-          SHA: ${{ steps.render.outputs.commit_sha }}
+          SHA: ${{ steps.resolve.outputs.commit_sha }}
         run: |
-          echo "deploying commit ${SHA}"
-          id=$(doctl compute droplet create "$NAME" \
-            --image ubuntu-24-04-x64 \
-            --region "$REGION" --size "$SIZE" \
-            --ssh-keys "$SSH_KEYS" \
-            --tag-names "peerkit,commit:${SHA}" \
-            --enable-monitoring \
-            --user-data-file user-data.yaml \
-            --wait --no-header --format ID)
+          # Exact-name match: `doctl compute droplet list <name>` globs, and a
+          # stale `-old-*` droplet must never be mistaken for the live one.
+          matches=$(doctl compute droplet list --no-header --format ID,Name \
+            | awk -v n="$NAME" '$2 == n { print $1 }')
+          count=$(printf '%s' "$matches" | grep -c . || true)
+          if [ "$count" -gt 1 ]; then
+            echo "::error::found $count droplets named $NAME; deploy needs exactly one - rename or delete the extras"
+            exit 1
+          fi
+          existing=$matches
+
+          if [ -n "$existing" ] && [ "$RECREATE" != "true" ]; then
+            id=$existing
+            echo "reusing droplet $id"
+            echo "created=false" >> "$GITHUB_OUTPUT"
+          else
+            if [ -n "$existing" ]; then
+              # Free the name before creating the replacement so the next run's
+              # lookup stays unambiguous. The old droplet keeps running for
+              # rollback.
+              old_name="${NAME}-old-${SHA:0:7}"
+              echo "renaming droplet $existing -> $old_name"
+              doctl compute droplet-action rename "$existing" --droplet-name "$old_name" --wait
+              echo "previous_droplet_id=$existing" >> "$GITHUB_OUTPUT"
+            fi
+            echo "creating droplet $NAME"
+            id=$(doctl compute droplet create "$NAME" \
+              --image ubuntu-24-04-x64 \
+              --region "$REGION" --size "$SIZE" \
+              --ssh-keys "$SSH_KEYS" \
+              --tag-names peerkit \
+              --enable-monitoring \
+              --user-data-file infra/cloud-init.yaml \
+              --wait --no-header --format ID)
+            echo "created=true" >> "$GITHUB_OUTPUT"
+          fi
           echo "droplet_id=$id" >> "$GITHUB_OUTPUT"
-          echo "commit_sha=$SHA" >> "$GITHUB_OUTPUT"
           ip=$(doctl compute droplet get "$id" --no-header --format PublicIPv4)
           echo "droplet_ip=$ip" >> "$GITHUB_OUTPUT"
 
-      # Wait for cloud-init to finish, then deliver the network secret and the
-      # persisted relay cert over SSH and restart the relay to adopt them.
-      - name: Deliver secrets over SSH
+      # Deliver the secrets, then run infra/deploy.sh on-box. deploy.sh is
+      # copied from this checkout rather than run out of /opt, because it
+      # rewrites that checkout while running.
+      - name: Deploy over SSH
         env:
           SSH_KEY: ${{ secrets.DO_SSH_PRIVATE_KEY }}
-          IP: ${{ steps.create.outputs.droplet_ip }}
+          IP: ${{ steps.droplet.outputs.droplet_ip }}
+          SHA: ${{ steps.resolve.outputs.commit_sha }}
+          RESERVED_IP: ${{ vars.RESERVED_IP }}
           NETWORK_SECRET: ${{ secrets.PEERKIT_NETWORK_SECRET }}
           RELAY_CERT_JSON: ${{ secrets.RELAY_CERT_JSON }}
         run: |
           # Remove every secret file on ANY exit, not just the success path, so
           # a failed validation/SSH/SCP/restart never leaves them in the
           # workspace for later steps.
-          trap 'rm -f key relay-cert.json network-secret.env' EXIT
+          trap 'rm -f key relay-cert.json relay-secrets.env' EXIT
           # Trailing newline required - OpenSSH rejects a key file without one.
           printf '%s\n' "$SSH_KEY" > key && chmod 600 key
           if ! ssh-keygen -y -f key >/dev/null 2>&1; then
@@ -139,8 +166,9 @@ jobs:
           remote() { ssh "${ssh_opts[@]}" "root@${IP}" "$@"; }
           # `doctl --wait` returns at "active", before sshd accepts connections,
           # so early attempts can be reset. Retry until the box answers, then
-          # block on cloud-init. Transport failure is exit 255 (retry); any
-          # other non-zero is a real cloud-init error (hard-fail).
+          # block on cloud-init (a no-op on a droplet that already booted).
+          # Transport failure is exit 255 (retry); any other non-zero is a real
+          # cloud-init error (hard-fail).
           deadline=$((SECONDS + 900))
           while :; do
             remote 'cloud-init status --wait' && break
@@ -155,6 +183,7 @@ jobs:
             echo "::error::cloud-init did not finish cleanly on the droplet"
             exit 1
           done
+
           # Validate inputs before mutating the box.
           if [ -z "$NETWORK_SECRET" ]; then
             echo "::error::PEERKIT_NETWORK_SECRET is empty"; exit 1
@@ -178,49 +207,70 @@ jobs:
             ' relay-cert.json >/dev/null 2>&1; then
             echo "::error::RELAY_CERT_JSON is not a valid RelayCertificate (need non-empty string privateKeyPem, certificatePem, certhash)"; exit 1
           fi
-          # Pass the network secret via a file (never on argv). Deliver both
-          # files, then append env lines on-box.
-          printf 'PEERKIT_NETWORK_SECRET=%s\n' "$NETWORK_SECRET" > network-secret.env
-          scp "${ssh_opts[@]}" relay-cert.json "root@${IP}:/tmp/relay-cert.json"
-          scp "${ssh_opts[@]}" network-secret.env "root@${IP}:/tmp/network-secret.env"
-          remote 'install -d -o peerkit -g peerkit -m 0750 /opt/peerkit-bootstrap-relay/certs
-                  install -o peerkit -g peerkit -m 0640 /tmp/relay-cert.json /opt/peerkit-bootstrap-relay/certs/relay-cert.json
-                  rm -f /tmp/relay-cert.json
-                  grep -q "^PEERKIT_RELAY_CERTIFICATE_FILE=" /etc/peerkit-relay.env || echo "PEERKIT_RELAY_CERTIFICATE_FILE=certs/relay-cert.json" >> /etc/peerkit-relay.env
-                  grep -q "^PEERKIT_NETWORK_SECRET=" /etc/peerkit-relay.env || cat /tmp/network-secret.env >> /etc/peerkit-relay.env
-                  rm -f /tmp/network-secret.env
-                  chown root:peerkit /etc/peerkit-relay.env
-                  chmod 0640 /etc/peerkit-relay.env
-                  systemctl restart peerkit-relay'
 
-      # Assign the Reserved IP only now that the new droplet is built and the
-      # relay has adopted its persisted cert.
+          # Secrets go in their own EnvironmentFile, rewritten on every deploy
+          # so rotating a secret takes effect. infra/deploy.sh never touches it,
+          # so re-rendering the non-secret env cannot drop these.
+          printf 'PEERKIT_NETWORK_SECRET=%s\n' "$NETWORK_SECRET" > relay-secrets.env
+          scp "${ssh_opts[@]}" relay-cert.json "root@${IP}:/tmp/relay-cert.json"
+          scp "${ssh_opts[@]}" relay-secrets.env "root@${IP}:/tmp/relay-secrets.env"
+          scp "${ssh_opts[@]}" infra/deploy.sh "root@${IP}:/tmp/peerkit-deploy.sh"
+          remote 'set -e
+                  install -d -o peerkit -g peerkit -m 0750 /opt/peerkit-bootstrap-relay/certs
+                  install -o peerkit -g peerkit -m 0640 /tmp/relay-cert.json /opt/peerkit-bootstrap-relay/certs/relay-cert.json
+                  install -o root -g peerkit -m 0640 /tmp/relay-secrets.env /etc/peerkit-relay.secrets.env
+                  rm -f /tmp/relay-cert.json /tmp/relay-secrets.env'
+          remote "set -e
+                  COMMIT_SHA='${SHA}' RESERVED_IP='${RESERVED_IP}' bash /tmp/peerkit-deploy.sh
+                  rm -f /tmp/peerkit-deploy.sh"
+
+      # The Reserved IP is the address peers dial and the host the relay
+      # announces, so it must end up on this droplet. Assigning an already
+      # assigned Reserved IP is an error in the DO API, so only move it when it
+      # is not already here.
       - name: Assign Reserved IP
         env:
           RESERVED_IP: ${{ vars.RESERVED_IP }}
-          ID: ${{ steps.create.outputs.droplet_id }}
+          ID: ${{ steps.droplet.outputs.droplet_id }}
         run: |
+          current=$(doctl compute reserved-ip get "$RESERVED_IP" --no-header --format DropletID)
+          if [ "$current" = "$ID" ]; then
+            echo "Reserved IP $RESERVED_IP already on droplet $ID"
+            exit 0
+          fi
+          # `assign` moves the IP off whatever droplet holds it, so there is no
+          # unassign step to leave it unrouted if the assign then fails.
+          echo "Reserved IP $RESERVED_IP currently on '${current:-none}', moving to $ID"
           action_id=$(doctl compute reserved-ip-action assign "$RESERVED_IP" "$ID" --no-header --format ID)
           doctl compute action wait "$action_id"
           echo "Reserved IP $RESERVED_IP -> droplet $ID"
 
       - name: Summary
         env:
-          IP: ${{ steps.create.outputs.droplet_ip }}
-          ID: ${{ steps.create.outputs.droplet_id }}
-          SHA: ${{ steps.create.outputs.commit_sha }}
+          IP: ${{ steps.droplet.outputs.droplet_ip }}
+          ID: ${{ steps.droplet.outputs.droplet_id }}
+          CREATED: ${{ steps.droplet.outputs.created }}
+          PREVIOUS_ID: ${{ steps.droplet.outputs.previous_droplet_id }}
+          SHA: ${{ steps.resolve.outputs.commit_sha }}
           RESERVED_IP: ${{ vars.RESERVED_IP }}
           RELAY_CERT_JSON: ${{ secrets.RELAY_CERT_JSON }}
         run: |
           certhash=$(jq -r '.certhash' <<<"$RELAY_CERT_JSON")
+          if [ "$CREATED" = "true" ]; then
+            mode="created droplet"
+          else
+            mode="redeployed onto existing droplet"
+          fi
           {
-            echo "Deployed droplet **$ID** ($IP) from commit \`$SHA\`."
-            echo "Reserved IP \`$RESERVED_IP\` now points at this droplet. DO monitoring enabled."
+            echo "Relay $mode **$ID** ($IP) at commit \`$SHA\`."
+            echo "Reserved IP \`$RESERVED_IP\` points at this droplet. DO monitoring enabled."
             echo ""
             echo "Relay certhash: \`$certhash\` - bake into client dial multiaddrs."
             echo "Announced multiaddr base: \`/ip4/$RESERVED_IP/tcp/4001\`; read the exact"
             echo "\`relay ready\` line from \`journalctl -u peerkit-relay\` for the peer id."
-            echo ""
-            echo "Old droplet (if any) left running; reassign the Reserved IP back to roll"
-            echo "back, then delete it manually after verifying."
+            if [ -n "$PREVIOUS_ID" ]; then
+              echo ""
+              echo "Replaced droplet **$PREVIOUS_ID**, renamed and left running. Reassign the"
+              echo "Reserved IP back to it to roll back, then delete it manually."
+            fi
           } >> "$GITHUB_STEP_SUMMARY"

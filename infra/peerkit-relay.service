@@ -1,0 +1,29 @@
+[Unit]
+Description=PeerKit bootstrap/relay (rendezvous for peer discovery)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=peerkit
+Group=peerkit
+WorkingDirectory=/opt/peerkit-bootstrap-relay
+# Non-secret env is re-rendered from infra/relay.env.tmpl on every deploy.
+EnvironmentFile=/etc/peerkit-relay.env
+# Secrets are delivered over SSH by the deploy workflow and never rewritten by
+# infra/deploy.sh, so a re-render cannot drop them.
+EnvironmentFile=/etc/peerkit-relay.secrets.env
+ExecStart=/usr/bin/node dist/index.js
+Restart=on-failure
+RestartSec=5
+# hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+
+[Install]
+WantedBy=multi-user.target
