@@ -50,8 +50,14 @@ The split matters:
 - `infra/deploy.sh` — everything commit-dependent: fetch/checkout the resolved
   SHA, `npm install`, `npm run build`, install `infra/peerkit-relay.service`,
   render `infra/relay.env.tmpl` to `/etc/peerkit-relay.env`, restart, verify
-  the unit is still active 15s later. Copied from the runner's checkout, not
-  run out of `/opt` (it rewrites that checkout).
+  the unit is still active 15s later. All checkout/build steps run as the
+  `peerkit` user that owns the tree; running git as root fails with "dubious
+  ownership".
+- The three `infra/` files are scp'd together to `/tmp/peerkit-infra/` from the
+  runner's checkout and `deploy.sh` reads its companions from its own
+  directory. So machine state tracks the ref the **workflow** ran from, while
+  the relay build tracks `repo_ref` — which may be an older commit that
+  predates these files.
 - Secrets live in a separate `EnvironmentFile`
   (`/etc/peerkit-relay.secrets.env`) that `deploy.sh` never rewrites, so
   re-rendering the non-secret env cannot drop them.

@@ -6,6 +6,9 @@ One long-lived DigitalOcean droplet, reused across deploys.
   firewall). Runs **once**, when the droplet is first created.
 - `deploy.sh` - everything that tracks the deployed commit: checkout, build,
   systemd unit, non-secret env, restart. Runs over SSH on **every** deploy.
+  It, the unit and the env template are copied to the droplet together, so
+  machine state comes from the branch the workflow runs from even when
+  `repo_ref` points at an older relay commit.
 - `peerkit-relay.service` - the systemd unit, reinstalled on every deploy.
 - `relay.env.tmpl` - non-secret env, re-rendered on every deploy.
 

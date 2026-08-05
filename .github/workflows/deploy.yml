@@ -214,15 +214,21 @@ jobs:
           printf 'PEERKIT_NETWORK_SECRET=%s\n' "$NETWORK_SECRET" > relay-secrets.env
           scp "${ssh_opts[@]}" relay-cert.json "root@${IP}:/tmp/relay-cert.json"
           scp "${ssh_opts[@]}" relay-secrets.env "root@${IP}:/tmp/relay-secrets.env"
-          scp "${ssh_opts[@]}" infra/deploy.sh "root@${IP}:/tmp/peerkit-deploy.sh"
           remote 'set -e
                   install -d -o peerkit -g peerkit -m 0750 /opt/peerkit-bootstrap-relay/certs
                   install -o peerkit -g peerkit -m 0640 /tmp/relay-cert.json /opt/peerkit-bootstrap-relay/certs/relay-cert.json
                   install -o root -g peerkit -m 0640 /tmp/relay-secrets.env /etc/peerkit-relay.secrets.env
-                  rm -f /tmp/relay-cert.json /tmp/relay-secrets.env'
+                  rm -f /tmp/relay-cert.json /tmp/relay-secrets.env
+                  rm -rf /tmp/peerkit-infra && mkdir -p /tmp/peerkit-infra'
+          # The unit and the env template ship next to deploy.sh, which reads
+          # them from its own directory: `repo_ref` can point at a commit older
+          # than these files, and the machine state must track the ref this
+          # workflow runs from, not the relay version being built.
+          scp "${ssh_opts[@]}" infra/deploy.sh infra/peerkit-relay.service infra/relay.env.tmpl \
+            "root@${IP}:/tmp/peerkit-infra/"
           remote "set -e
-                  COMMIT_SHA='${SHA}' RESERVED_IP='${RESERVED_IP}' bash /tmp/peerkit-deploy.sh
-                  rm -f /tmp/peerkit-deploy.sh"
+                  COMMIT_SHA='${SHA}' RESERVED_IP='${RESERVED_IP}' bash /tmp/peerkit-infra/deploy.sh
+                  rm -rf /tmp/peerkit-infra"
 
       # The Reserved IP is the address peers dial and the host the relay
       # announces, so it must end up on this droplet. Assigning an already
