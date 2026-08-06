@@ -42,10 +42,11 @@ fresh droplet running under a hardened `peerkit-relay` systemd unit, delivers
 `PEERKIT_NETWORK_SECRET` and the persisted relay certificate over SSH (so
 neither lands in DO user-data), then reassigns a DigitalOcean Reserved IP.
 
-Droplets are immutable: each deploy creates a new droplet and reassigns the
-Reserved IP; the old one is left running for rollback and deleted manually. The
-Reserved IP plus the persisted certificate certhash keep the announced
-multiaddr stable across replacements.
+Droplets are immutable: each deploy creates a new droplet, reassigns the
+Reserved IP, then destroys the droplets that held the name before the run
+(teardown runs only after the reassignment succeeds). The Reserved IP plus the
+persisted certificate certhash keep the announced multiaddr stable across
+replacements.
 
 `@peerkit/relay` does not expose an HTTP endpoint, so readiness is read from
 the container logs (`journalctl -u peerkit-relay`) rather than HTTP.
