@@ -17,9 +17,9 @@ Run the **Deploy relay** workflow (Actions -> Run workflow). Inputs:
 `repo_ref` (relay version to build), `region`, `size`. Each run renders
 `cloud-init.yaml`, creates a fresh droplet (immutable model), delivers the
 network secret and persisted relay certificate over SSH, and reassigns the
-Reserved IP to the new droplet. The old droplet is left running so a bad
-deploy is rolled back by reassigning the Reserved IP back; delete it manually
-after verifying.
+Reserved IP to the new droplet, then destroys the droplets that held the name
+before the run. Teardown happens only after the Reserved IP moved, so a failure
+at any earlier step leaves the old droplet serving traffic.
 
 ### Required GitHub secrets
 

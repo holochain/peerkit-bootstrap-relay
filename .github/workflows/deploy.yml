@@ -14,8 +14,9 @@ name: Deploy relay
 #
 # Immutable model: each run creates a NEW droplet. The network secret and the
 # relay cert private key never touch cloud-init user-data (delivered over SSH).
-# The old droplet is left running so a bad deploy can be rolled back by
-# reassigning the Reserved IP back; delete it manually after verifying.
+# Order matters: create -> provision -> assign the Reserved IP -> only then
+# destroy the droplets that held the name before this run. A failure at any
+# earlier step leaves the old droplet serving the Reserved IP.
 on:
   workflow_dispatch:
     inputs:
@@ -90,6 +91,17 @@ jobs:
             echo "::error::rendered user-data contains non-ASCII bytes; cloud-init would reject it"
             exit 1
           fi
+
+      # Snapshot the droplets holding the name *before* the new one exists, so
+      # the teardown step cannot match the droplet this run just created.
+      - name: List existing droplets
+        id: existing
+        env:
+          NAME: ${{ env.DROPLET_NAME }}
+        run: |
+          ids=$(doctl compute droplet list "$NAME" --no-header --format ID | tr '\n' ' ')
+          echo "old_ids=$ids" >> "$GITHUB_OUTPUT"
+          echo "existing droplets: ${ids:-none}"
 
       - name: Create droplet
         id: create
@@ -204,6 +216,21 @@ jobs:
           doctl compute action wait "$action_id"
           echo "Reserved IP $RESERVED_IP -> droplet $ID"
 
+      # Runs only after the assign step succeeded, so the Reserved IP is already
+      # on the new droplet before anything is destroyed.
+      - name: Destroy previous droplets
+        env:
+          OLD_IDS: ${{ steps.existing.outputs.old_ids }}
+          NEW_ID: ${{ steps.create.outputs.droplet_id }}
+        run: |
+          for id in $OLD_IDS; do
+            if [ "$id" = "$NEW_ID" ]; then
+              continue
+            fi
+            doctl compute droplet delete "$id" --force
+            echo "destroyed droplet $id"
+          done
+
       - name: Summary
         env:
           IP: ${{ steps.create.outputs.droplet_ip }}
@@ -211,6 +238,7 @@ jobs:
           SHA: ${{ steps.create.outputs.commit_sha }}
           RESERVED_IP: ${{ vars.RESERVED_IP }}
           RELAY_CERT_JSON: ${{ secrets.RELAY_CERT_JSON }}
+          OLD_IDS: ${{ steps.existing.outputs.old_ids }}
         run: |
           certhash=$(jq -r '.certhash' <<<"$RELAY_CERT_JSON")
           {
@@ -221,6 +249,5 @@ jobs:
             echo "Announced multiaddr base: \`/ip4/$RESERVED_IP/tcp/4001\`; read the exact"
             echo "\`relay ready\` line from \`journalctl -u peerkit-relay\` for the peer id."
             echo ""
-            echo "Old droplet (if any) left running; reassign the Reserved IP back to roll"
-            echo "back, then delete it manually after verifying."
+            echo "Previous droplets destroyed after the Reserved IP moved: \`${OLD_IDS:-none}\`."
           } >> "$GITHUB_STEP_SUMMARY"
